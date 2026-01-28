@@ -25,7 +25,21 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-device = "cuda:0" if torch.cuda.is_available() else "cpu"
+# Allow device override via environment variable
+device_env = os.getenv("QWEN_DEVICE", "auto")
+if device_env == "auto":
+    device = "cuda:0" if torch.cuda.is_available() else "cpu"
+else:
+    device = device_env
+
+# Select appropriate dtype based on device
+# CPU performs better with float32, GPU can use bfloat16
+if device == "cpu":
+    dtype = torch.float32
+    logging.info("Using CPU with float32 dtype")
+else:
+    dtype = torch.bfloat16
+    logging.info(f"Using {device} with bfloat16 dtype")
 
 # Initialize Qwen3-TTS model
 from qwen_tts import Qwen3TTSModel
@@ -34,7 +48,7 @@ logging.info(f"Loading Qwen3-TTS model on {device}...")
 model = Qwen3TTSModel.from_pretrained(
     "Qwen/Qwen3-TTS-12Hz-1.7B-Base",
     device_map=device,
-    dtype=torch.bfloat16,
+    dtype=dtype,
 )
 logging.info("Qwen3-TTS model loaded successfully")
 
