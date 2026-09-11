@@ -1,0 +1,241 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SOURCE_DIR="${QWEN3_TTS_SOURCE:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+DATA_DIR="${QWEN3_TTS_DATA_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/qwen3-tts}"
+ENGINE="${QWEN_CONTAINER_ENGINE:-docker}"
+BACKEND="${QWEN_BACKEND:-rocm}"
+PORT="${QWEN_PORT:-7860}"
+BIND_ADDRESS="${QWEN_BIND_ADDRESS:-127.0.0.1}"
+CONTAINER_NAME="${QWEN_CONTAINER_NAME:-qwen3-tts-zara}"
+
+die() {
+    printf 'qwen3-tts: %s\n' "$*" >&2
+    exit 1
+}
+
+usage() {
+    cat <<'EOF'
+Usage: qwen3-tts COMMAND [ARGS]
+
+  build [rocm|cuda|cpu]       Build the selected container image
+  serve [rocm|cuda|cpu]       Run in the foreground (for systemd)
+  start [rocm|cuda|cpu]       Run persistently in the background
+  stop                        Stop the server
+  restart [rocm|cuda|cpu]     Restart the server
+  status                      Show container and API status
+  logs [-f]                   Show server logs
+  doctor [rocm|cuda|cpu]      Check host and container GPU access
+  install-user [BACKEND]      Install and start a systemd user service
+  uninstall-user              Remove the systemd user service
+  voice COMMAND ...           Add, list, rename, remove, or export voices
+
+Examples:
+  qwen3-tts voice add zara interview.mp4 --start 01:12 --text "Exact words spoken"
+  qwen3-tts voice add zara sample.mp3 --replace
+  qwen3-tts voice set-default zara
+  qwen3-tts install-user rocm
+EOF
+}
+
+image_for() {
+    local backend="$1"
+    printf '%s\n' "${QWEN_IMAGE:-qwen3-tts_server:${backend}}"
+}
+
+dockerfile_for() {
+    case "$1" in
+        rocm) printf '%s\n' Dockerfile.rocm ;;
+        cuda) printf '%s\n' Dockerfile.cuda ;;
+        cpu) printf '%s\n' Dockerfile.cpu ;;
+        *) die "unknown backend '$1'; expected rocm, cuda, or cpu" ;;
+    esac
+}
+
+prepare_data() {
+    mkdir -p "$DATA_DIR/voices" "$DATA_DIR/outputs" \
+        "$DATA_DIR/cache/huggingface" "$DATA_DIR/cache/whisper"
+    if ! find "$DATA_DIR/voices" -maxdepth 1 -type f -print -quit | grep -q .; then
+        cp "$SOURCE_DIR/demo_speaker0.mp3" "$DATA_DIR/voices/"
+    fi
+}
+
+build_image() {
+    local backend="$1"
+    local image
+    local -a build_args=()
+    image="$(image_for "$backend")"
+    if [[ "$backend" == rocm && -n "${QWEN_ROCM_IMAGE:-}" ]]; then
+        build_args+=(--build-arg "ROCM_IMAGE=$QWEN_ROCM_IMAGE")
+    fi
+    "$ENGINE" build \
+        --file "$SOURCE_DIR/$(dockerfile_for "$backend")" \
+        --tag "$image" \
+        "${build_args[@]}" \
+        "$SOURCE_DIR"
+}
+
+ensure_image() {
+    local backend="$1"
+    local image
+    image="$(image_for "$backend")"
+    if ! "$ENGINE" image inspect "$image" >/dev/null 2>&1; then
+        build_image "$backend"
+    fi
+}
+
+device_args() {
+    local backend="$1"
+    case "$backend" in
+        rocm)
+            [[ -e /dev/kfd ]] || die "/dev/kfd is missing; load/install the AMDGPU/ROCm host driver"
+            [[ -d /dev/dri ]] || die "/dev/dri is missing; load/install the AMDGPU host driver"
+            printf '%s\n' --device=/dev/kfd --device=/dev/dri --group-add="$(stat -c %g /dev/kfd)" \
+                --ipc=host --shm-size=8g \
+                --security-opt=seccomp=unconfined
+            ;;
+        cuda)
+            printf '%s\n' --gpus=all
+            ;;
+        cpu) ;;
+        *) die "unknown backend '$backend'" ;;
+    esac
+}
+
+environment_args() {
+    local variable
+    for variable in QWEN_DEVICE QWEN_DTYPE QWEN_MODEL QWEN_WHISPER_MODEL \
+        QWEN_ATTENTION HSA_OVERRIDE_GFX_VERSION HIP_VISIBLE_DEVICES; do
+        if [[ -n "${!variable:-}" ]]; then
+            printf '%s\n' --env "$variable=${!variable}"
+        fi
+    done
+}
+
+container_args() {
+    local backend="$1"
+    printf '%s\n' \
+        --name "$CONTAINER_NAME" \
+        --init \
+        --publish "$BIND_ADDRESS:$PORT:7860" \
+        --volume "$DATA_DIR/voices:/app/server/resources" \
+        --volume "$DATA_DIR/outputs:/app/server/outputs" \
+        --volume "$DATA_DIR/cache/huggingface:/root/.cache/huggingface" \
+        --volume "$DATA_DIR/cache/whisper:/root/.cache/whisper" \
+        --env QWEN_RESOURCES_DIR=/app/server/resources \
+        --env QWEN_OUTPUT_DIR=/app/server/outputs \
+        --env QWEN_DEVICE="${QWEN_DEVICE:-auto}"
+    device_args "$backend"
+    environment_args
+}
+
+run_server() {
+    local backend="$1"
+    local mode="$2"
+    local image
+    local -a args
+    ensure_image "$backend"
+    prepare_data
+    image="$(image_for "$backend")"
+    mapfile -t args < <(container_args "$backend")
+    "$ENGINE" rm --force "$CONTAINER_NAME" >/dev/null 2>&1 || true
+    if [[ "$mode" == foreground ]]; then
+        exec "$ENGINE" run --rm "${args[@]}" "$image"
+    fi
+    "$ENGINE" run --detach --restart=unless-stopped "${args[@]}" "$image"
+    printf 'Qwen3-TTS is starting for Zara at http://%s:%s\n' "$BIND_ADDRESS" "$PORT"
+}
+
+doctor() {
+    local backend="$1"
+    command -v "$ENGINE" >/dev/null || die "$ENGINE is not installed"
+    "$ENGINE" info >/dev/null || die "$ENGINE daemon is not available to this user"
+    printf 'engine: %s\nbackend: %s\ndata: %s\n' "$ENGINE" "$backend" "$DATA_DIR"
+    if [[ "$backend" == rocm ]]; then
+        [[ -e /dev/kfd ]] && printf '/dev/kfd: ok\n' || printf '/dev/kfd: missing\n'
+        [[ -d /dev/dri ]] && printf '/dev/dri: ok\n' || printf '/dev/dri: missing\n'
+    fi
+    local image
+    image="$(image_for "$backend")"
+    if "$ENGINE" image inspect "$image" >/dev/null 2>&1; then
+        local -a args
+        mapfile -t args < <(device_args "$backend")
+        "$ENGINE" run --rm --entrypoint python "${args[@]}" "$image" -c \
+            'import torch; print({"available": torch.cuda.is_available(), "hip": torch.version.hip, "device": torch.cuda.get_device_name(0) if torch.cuda.is_available() else None})'
+    else
+        printf 'image: not built (run qwen3-tts build %s)\n' "$backend"
+    fi
+}
+
+install_user_service() {
+    local backend="$1"
+    [[ -n "${QWEN3_TTS_EXECUTABLE:-}" ]] || die "run this through the flake: nix run .#qwen3-tts -- install-user $backend"
+    local profile="${XDG_STATE_HOME:-$HOME/.local/state}/qwen3-tts/profile"
+    mkdir -p "$(dirname "$profile")"
+    nix build --out-link "$profile" "$SOURCE_DIR#qwen3-tts"
+    local executable="$profile/bin/qwen3-tts"
+    local unit_dir="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+    local unit="$unit_dir/qwen3-tts.service"
+    mkdir -p "$unit_dir"
+    {
+        printf '%s\n' '[Unit]' 'Description=Qwen3-TTS service for Zara' 'After=network-online.target' 'Wants=network-online.target'
+        printf '\n%s\n' '[Service]' 'Type=simple' "Environment=QWEN_BACKEND=$backend" "Environment=QWEN3_TTS_DATA_DIR=$DATA_DIR"
+        printf 'Environment=QWEN_PORT=%s\n' "$PORT"
+        printf 'Environment=QWEN_BIND_ADDRESS=%s\n' "$BIND_ADDRESS"
+        printf 'Environment=QWEN_CONTAINER_ENGINE=%s\n' "$ENGINE"
+        for variable in QWEN_DEVICE QWEN_DTYPE QWEN_MODEL QWEN_WHISPER_MODEL \
+            QWEN_ATTENTION QWEN_ROCM_IMAGE HSA_OVERRIDE_GFX_VERSION HIP_VISIBLE_DEVICES; do
+            if [[ -n "${!variable:-}" ]]; then
+                [[ "${!variable}" != *$'\n'* ]] || die "$variable cannot contain a newline"
+                printf 'Environment=%s=%s\n' "$variable" "${!variable}"
+            fi
+        done
+        printf 'ExecStart=%s serve %s\n' "$executable" "$backend"
+        printf 'ExecStop=%s stop\n' "$executable"
+        printf '%s\n' 'Restart=always' 'RestartSec=5' 'TimeoutStartSec=infinity'
+        printf '\n%s\n' '[Install]' 'WantedBy=default.target'
+    } >"$unit"
+    systemctl --user daemon-reload
+    systemctl --user enable --now qwen3-tts.service
+    printf 'installed %s\n' "$unit"
+    printf 'For startup before login, run: sudo loginctl enable-linger %q\n' "$USER"
+}
+
+uninstall_user_service() {
+    local unit="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/qwen3-tts.service"
+    local profile="${XDG_STATE_HOME:-$HOME/.local/state}/qwen3-tts/profile"
+    systemctl --user disable --now qwen3-tts.service 2>/dev/null || true
+    rm -f "$unit"
+    rm -f "$profile"
+    systemctl --user daemon-reload
+    printf 'removed %s and its Nix profile link\n' "$unit"
+}
+
+command="${1:-help}"
+shift || true
+
+case "$command" in
+    build) build_image "${1:-$BACKEND}" ;;
+    serve) run_server "${1:-$BACKEND}" foreground ;;
+    start) run_server "${1:-$BACKEND}" detached ;;
+    stop) "$ENGINE" rm --force "$CONTAINER_NAME" >/dev/null 2>&1 || true ;;
+    restart)
+        backend="${1:-$BACKEND}"
+        "$ENGINE" rm --force "$CONTAINER_NAME" >/dev/null 2>&1 || true
+        run_server "$backend" detached
+        ;;
+    status)
+        "$ENGINE" ps --all --filter "name=^/${CONTAINER_NAME}$"
+        curl --fail --silent --show-error "http://$BIND_ADDRESS:$PORT/health" | jq . || true
+        ;;
+    logs) "$ENGINE" logs "$@" "$CONTAINER_NAME" ;;
+    doctor) doctor "${1:-$BACKEND}" ;;
+    install-user) install_user_service "${1:-$BACKEND}" ;;
+    uninstall-user) uninstall_user_service ;;
+    voice)
+        prepare_data
+        exec python3 "$SOURCE_DIR/scripts/voice_manager.py" --directory "$DATA_DIR/voices" "$@"
+        ;;
+    help|-h|--help) usage ;;
+    *) usage >&2; die "unknown command '$command'" ;;
+esac

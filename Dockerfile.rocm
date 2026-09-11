@@ -1,0 +1,45 @@
+# AMD ROCm runtime. Override this build arg to pin a host-compatible tested image.
+ARG ROCM_IMAGE=rocm/pytorch:latest
+FROM ${ROCM_IMAGE}
+
+ARG DEBIAN_FRONTEND=noninteractive
+
+LABEL maintainer="Qwen3-TTS Server"
+LABEL description="AMD ROCm-enabled Qwen3-TTS server for Zara"
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ffmpeg \
+    git \
+    libmagic1 \
+    libsndfile1 \
+    libsox-fmt-all \
+    python3-dev \
+    sox \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app/server
+
+COPY requirements.txt /tmp/requirements.txt
+
+# The ROCm base already contains a matched torch/torchaudio build. Do not add
+# CUDA-only flash-attn or replace those wheels with a generic PyPI build.
+RUN python -m pip install --no-cache-dir --upgrade pip setuptools wheel \
+    && python -m pip install --no-cache-dir -r /tmp/requirements.txt
+
+COPY server.py start.sh ./
+COPY demo_speaker0.mp3 ./resources/demo_speaker0.mp3
+
+RUN mkdir -p outputs resources \
+    && chmod +x start.sh
+
+ENV PYTHONUNBUFFERED=1 \
+    QWEN_DEVICE=auto \
+    QWEN_RESOURCES_DIR=/app/server/resources \
+    QWEN_OUTPUT_DIR=/app/server/outputs
+
+EXPOSE 7860
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=15m --retries=3 \
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:7860/health', timeout=4)"
+
+CMD ["python", "-m", "uvicorn", "server:app", "--host", "0.0.0.0", "--port", "7860"]

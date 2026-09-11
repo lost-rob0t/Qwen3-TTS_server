@@ -1,13 +1,19 @@
 #!/bin/bash
 # Build script for Qwen3-TTS server
-# Supports both CPU and CUDA modes
+# Supports CPU, CUDA, and AMD ROCm modes
 
-set -e
+set -euo pipefail
 
 MODE="${1:-cuda}"
-TAG_SUFFIX=""
 
 case "$MODE" in
+    rocm|amd)
+        echo "Building AMD ROCm version..."
+        docker build -f Dockerfile.rocm -t qwen3-tts_server:rocm .
+        docker tag qwen3-tts_server:rocm qwen3-tts_server:latest
+        echo "✓ Built: qwen3-tts_server:rocm"
+        echo "✓ Tagged: qwen3-tts_server:latest"
+        ;;
     cpu)
         echo "Building CPU-only version..."
         docker build -f Dockerfile.cpu -t qwen3-tts_server:cpu .
@@ -30,9 +36,10 @@ case "$MODE" in
         echo "✓ Tagged: qwen3-tts_server:latest"
         ;;
     *)
-        echo "Usage: $0 {cpu|cuda|both}"
+        echo "Usage: $0 {rocm|cpu|cuda|both}"
         echo ""
         echo "Examples:"
+        echo "  $0 rocm    # Build AMD ROCm version"
         echo "  $0 cpu     # Build CPU-only version"
         echo "  $0 cuda    # Build CUDA version (default)"
         echo "  $0 both    # Build both versions"
