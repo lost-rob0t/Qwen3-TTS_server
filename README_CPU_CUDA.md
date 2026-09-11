@@ -43,20 +43,6 @@ docker run -p 7860:7860 qwen3-tts_server:cpu
 docker run --gpus all -p 7860:7860 qwen3-tts_server:cuda
 ```
 
-### With Docker Compose
-
-The docker-compose.yml in the Zarathushtra project supports both modes via profiles.
-
-**CPU Mode:**
-```bash
-docker-compose --profile cpu up
-```
-
-**CUDA Mode:**
-```bash
-docker-compose --profile cuda up
-```
-
 ## Configuration
 
 ### Environment Variables
@@ -167,29 +153,6 @@ curl "http://localhost:7860/synthesize_speech/?text=Test&voice=my_voice" \
     --build-arg CUDA_VERSION=11.8.0 \
     -t qwen3-tts_server:cuda .
   ```
-
-## Integration with Zara
-
-Update your environment variables:
-
-```bash
-# For CUDA mode
-export ZARA_TTS_PROVIDER=qwen3
-export QWEN3_TTS_URL=http://localhost:7860
-export QWEN3_VOICE=demo_speaker0
-
-# For CPU mode (same configuration)
-export ZARA_TTS_PROVIDER=qwen3
-export QWEN3_TTS_URL=http://localhost:7860
-export QWEN3_VOICE=demo_speaker0
-```
-
-Start Zara wake mode:
-```bash
-nix run .#zara -- --wake
-```
-
-The TTS client will automatically connect to whichever server is running.
 
 ## Development
 

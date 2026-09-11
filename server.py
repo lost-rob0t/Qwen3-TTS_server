@@ -1,5 +1,8 @@
 import os
 import time
+import json
+import re
+import tempfile
 import torch
 from fastapi import FastAPI, UploadFile, File, HTTPException, Form
 from fastapi.middleware.cors import CORSMiddleware
@@ -11,6 +14,7 @@ import io
 import magic
 import logging
 import numpy as np
+from pathlib import Path
 
 logging.basicConfig(level=logging.INFO)
 
@@ -25,45 +29,69 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Allow device override via environment variable
-device_env = os.getenv("QWEN_DEVICE", "auto")
-if device_env == "auto":
-    device = "cuda:0" if torch.cuda.is_available() else "cpu"
-else:
-    device = device_env
+def resolve_device() -> str:
+    """Resolve the torch device. ROCm intentionally uses the CUDA device API."""
+    requested = os.getenv("QWEN_DEVICE", "auto")
+    if requested != "auto":
+        return requested
+    return "cuda:0" if torch.cuda.is_available() else "cpu"
 
-# Select appropriate dtype based on device
-# CPU performs better with float32, GPU can use bfloat16
-if device == "cpu":
-    dtype = torch.float32
-    logging.info("Using CPU with float32 dtype")
-else:
-    dtype = torch.bfloat16
-    logging.info(f"Using {device} with bfloat16 dtype")
+
+def resolve_dtype(selected_device: str):
+    requested = os.getenv("QWEN_DTYPE", "auto").lower()
+    choices = {
+        "float16": torch.float16,
+        "fp16": torch.float16,
+        "bfloat16": torch.bfloat16,
+        "bf16": torch.bfloat16,
+        "float32": torch.float32,
+        "fp32": torch.float32,
+    }
+    if requested != "auto":
+        if requested not in choices:
+            raise RuntimeError(f"Unsupported QWEN_DTYPE: {requested}")
+        return choices[requested]
+    if selected_device == "cpu":
+        return torch.float32
+    try:
+        return torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    except (AttributeError, RuntimeError):
+        return torch.float16
+
+
+device = resolve_device()
+dtype = resolve_dtype(device)
+accelerator = "rocm" if getattr(torch.version, "hip", None) else (
+    "cuda" if device.startswith("cuda") else "cpu"
+)
+logging.info("Using %s backend on %s with %s", accelerator, device, dtype)
 
 # Initialize Qwen3-TTS model
 from qwen_tts import Qwen3TTSModel
 
-logging.info(f"Loading Qwen3-TTS model on {device}...")
-model = Qwen3TTSModel.from_pretrained(
-    "Qwen/Qwen3-TTS-12Hz-1.7B-Base",
-    device_map=device,
-    dtype=dtype,
-)
+model_id = os.getenv("QWEN_MODEL", "Qwen/Qwen3-TTS-12Hz-1.7B-Base")
+model_kwargs = {"device_map": device, "dtype": dtype}
+if attention := os.getenv("QWEN_ATTENTION"):
+    model_kwargs["attn_implementation"] = attention
+logging.info("Loading Qwen3-TTS model %s on %s...", model_id, device)
+model = Qwen3TTSModel.from_pretrained(model_id, **model_kwargs)
 logging.info("Qwen3-TTS model loaded successfully")
 
 # Initialize Whisper for transcription (Qwen3-TTS doesn't have built-in transcription)
 import whisper
 
 logging.info("Loading Whisper model for transcription...")
-whisper_model = whisper.load_model("base", device=device)
+whisper_model = whisper.load_model(os.getenv("QWEN_WHISPER_MODEL", "base"), device=device)
 logging.info("Whisper model loaded successfully")
 
-output_dir = 'outputs'
-os.makedirs(output_dir, exist_ok=True)
+output_dir = Path(os.getenv("QWEN_OUTPUT_DIR", "outputs")).expanduser().resolve()
+output_dir.mkdir(parents=True, exist_ok=True)
 
-resources_dir = 'resources'
-os.makedirs(resources_dir, exist_ok=True)
+resources_dir = Path(os.getenv("QWEN_RESOURCES_DIR", "resources")).expanduser().resolve()
+resources_dir.mkdir(parents=True, exist_ok=True)
+
+VOICE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
+AUDIO_EXTENSIONS = (".wav", ".flac", ".mp3", ".ogg", ".m4a", ".aac")
 
 # Default reference audio and text for base_tts
 default_ref_audio = None
@@ -74,7 +102,45 @@ default_voice_prompt = None
 voice_cache = {}
 
 
-def convert_to_wav(input_path: str, output_path: str):
+def validate_voice_name(voice: str) -> str:
+    if not VOICE_NAME.fullmatch(voice):
+        raise HTTPException(
+            status_code=400,
+            detail="Voice names must be 1-64 letters, numbers, underscores, or hyphens.",
+        )
+    return voice
+
+
+def find_voice_file(voice: str) -> Path | None:
+    voice = validate_voice_name(voice)
+    for extension in AUDIO_EXTENSIONS:
+        candidate = resources_dir / f"{voice}{extension}"
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def load_reference_text(reference_file: Path) -> str | None:
+    metadata_file = reference_file.with_suffix(".json")
+    if not metadata_file.is_file():
+        return None
+    try:
+        metadata = json.loads(metadata_file.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as error:
+        logging.warning("Ignoring invalid voice metadata %s: %s", metadata_file, error)
+        return None
+    text = metadata.get("reference_text")
+    return text.strip() if isinstance(text, str) and text.strip() else None
+
+
+def voice_fingerprint(reference_file: Path) -> tuple:
+    metadata_file = reference_file.with_suffix(".json")
+    metadata_stamp = metadata_file.stat().st_mtime_ns if metadata_file.exists() else None
+    stat = reference_file.stat()
+    return stat.st_mtime_ns, stat.st_size, metadata_stamp
+
+
+def convert_to_wav(input_path: str | Path, output_path: str | Path):
     """Convert any audio format to WAV using pydub."""
     audio = AudioSegment.from_file(input_path)
     audio = audio.set_channels(1)  # Convert to mono
@@ -91,7 +157,7 @@ def transcribe_audio(audio_path: str) -> str:
 def detect_leading_silence(audio, silence_threshold=-42, chunk_size=10):
     """Detect silence at the beginning of the audio."""
     trim_ms = 0
-    while audio[trim_ms:trim_ms + chunk_size].dBFS < silence_threshold and trim_ms < len(audio):
+    while trim_ms < len(audio) and audio[trim_ms:trim_ms + chunk_size].dBFS < silence_threshold:
         trim_ms += chunk_size
     return trim_ms
 
@@ -104,12 +170,14 @@ def remove_silence_edges(audio, silence_threshold=-42):
     return audio[start_trim:duration - end_trim]
 
 
-def process_reference_audio(reference_file: str) -> tuple[str, str]:
+def process_reference_audio(reference_file: str | Path, voice: str) -> tuple[Path, str]:
     """
     Process reference audio: clip to max 15s and transcribe.
     Returns (processed_audio_path, transcription).
     """
-    temp_short_ref = f'{output_dir}/temp_short_ref.wav'
+    processed_dir = output_dir / "processed"
+    processed_dir.mkdir(parents=True, exist_ok=True)
+    temp_short_ref = processed_dir / f"{voice}.wav"
     aseg = AudioSegment.from_file(reference_file)
 
     # 1. try to find long silence for clipping
@@ -143,10 +211,18 @@ def process_reference_audio(reference_file: str) -> tuple[str, str]:
         logging.info("Audio is over 15s, clipping short. (3)")
 
     aseg = remove_silence_edges(aseg) + AudioSegment.silent(duration=50)
-    aseg.export(temp_short_ref, format='wav')
+    with tempfile.NamedTemporaryFile(
+        dir=processed_dir, prefix=f".{voice}-", suffix=".wav", delete=False
+    ) as temporary:
+        temporary_path = Path(temporary.name)
+    try:
+        aseg.export(temporary_path, format="wav")
+        temporary_path.replace(temp_short_ref)
+    finally:
+        temporary_path.unlink(missing_ok=True)
 
-    # Transcribe the short clip
-    ref_text = transcribe_audio(temp_short_ref)
+    # A voice manifest can supply an exact transcript and avoid Whisper work.
+    ref_text = load_reference_text(Path(reference_file)) or transcribe_audio(str(temp_short_ref))
     logging.info(f'Reference text transcribed from first 15s: {ref_text}')
 
     return temp_short_ref, ref_text
@@ -232,7 +308,7 @@ def audio_to_wav_bytes(audio_data: np.ndarray, sr: int) -> io.BytesIO:
     return buffer
 
 
-def get_or_create_voice_cache(voice: str, reference_file: str) -> dict:
+def get_or_create_voice_cache(voice: str, reference_file: str | Path) -> dict:
     """
     Get cached voice data or create new cache entry.
     Caches: processed audio path, transcription, and voice clone prompt.
@@ -240,14 +316,16 @@ def get_or_create_voice_cache(voice: str, reference_file: str) -> dict:
     """
     global voice_cache
     
-    if voice in voice_cache:
+    reference_file = Path(reference_file)
+    fingerprint = voice_fingerprint(reference_file)
+    if voice in voice_cache and voice_cache[voice].get("fingerprint") == fingerprint:
         logging.info(f"Using cached voice data for: {voice}")
         return voice_cache[voice]
     
     logging.info(f"Creating voice cache for: {voice}")
     
     # Process reference audio (clip to 15s, remove silence)
-    processed_ref, ref_text = process_reference_audio(reference_file)
+    processed_ref, ref_text = process_reference_audio(reference_file, voice)
     
     # Create reusable voice clone prompt
     ref_audio_data, ref_sr = sf.read(processed_ref)
@@ -263,6 +341,7 @@ def get_or_create_voice_cache(voice: str, reference_file: str) -> dict:
         "prompt": voice_prompt,
         "audio_data": ref_audio_data,
         "sample_rate": ref_sr,
+        "fingerprint": fingerprint,
     }
     
     logging.info(f"Voice cache created for: {voice} (transcription: '{ref_text[:50]}...')")
@@ -275,17 +354,16 @@ async def startup_event():
     global default_ref_audio, default_voice_prompt
     
     # Check if we have a default voice file
-    default_files = [f for f in os.listdir(resources_dir) if f.startswith("default_en")]
-    if default_files:
-        default_ref_audio = f"{resources_dir}/{default_files[0]}"
-        if not default_ref_audio.endswith('.wav'):
-            wav_path = f"{resources_dir}/default_en.wav"
+    default_file = find_voice_file("default_en")
+    if default_file:
+        default_ref_audio = default_file
+        if default_ref_audio.suffix.lower() != ".wav":
+            wav_path = resources_dir / "default_en.wav"
             convert_to_wav(default_ref_audio, wav_path)
             default_ref_audio = wav_path
     
     # Warmup with demo_speaker0 if available
-    demo_files = [f for f in os.listdir(resources_dir) if f.startswith("demo_speaker0")]
-    if demo_files:
+    if find_voice_file("demo_speaker0"):
         logging.info("Warming up model with demo_speaker0...")
         test_text = "This is a test sentence generated by the Qwen3-TTS API."
         try:
@@ -307,6 +385,39 @@ async def base_tts(text: str, speed: Optional[float] = 1.0):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.get("/health")
+async def health():
+    gpu_name = None
+    if device.startswith("cuda") and torch.cuda.is_available():
+        gpu_name = torch.cuda.get_device_name(0)
+    return {
+        "status": "ok",
+        "backend": accelerator,
+        "device": device,
+        "dtype": str(dtype).removeprefix("torch."),
+        "gpu": gpu_name,
+        "model": model_id,
+    }
+
+
+@app.get("/voices/")
+async def list_voices():
+    voices = []
+    for candidate in sorted(resources_dir.iterdir()):
+        if candidate.suffix.lower() not in AUDIO_EXTENSIONS:
+            continue
+        if not VOICE_NAME.fullmatch(candidate.stem):
+            continue
+        if find_voice_file(candidate.stem) != candidate:
+            continue
+        voices.append({
+            "name": candidate.stem,
+            "format": candidate.suffix.removeprefix("."),
+            "reference_text": load_reference_text(candidate),
+        })
+    return {"voices": voices}
+
+
 @app.post("/change_voice/")
 async def change_voice(reference_speaker: str = Form(...), file: UploadFile = File(...)):
     """
@@ -318,20 +429,18 @@ async def change_voice(reference_speaker: str = Form(...), file: UploadFile = Fi
         contents = await file.read()
         
         # Save the input audio temporarily
-        input_path = f'{output_dir}/input_audio.wav'
+        input_path = output_dir / "input_audio.wav"
         with open(input_path, 'wb') as f:
             f.write(contents)
 
         # Find the reference audio file
-        matching_files = [f for f in os.listdir(resources_dir) if f.startswith(str(reference_speaker))]
-        if not matching_files:
+        reference_file = find_voice_file(reference_speaker)
+        if not reference_file:
             raise HTTPException(status_code=400, detail="No matching reference speaker found.")
         
-        reference_file = f'{resources_dir}/{matching_files[0]}'
-        
         # Convert reference file to WAV if it's not already
-        if not reference_file.lower().endswith('.wav'):
-            ref_wav_path = f'{output_dir}/ref_converted.wav'
+        if reference_file.suffix.lower() != ".wav":
+            ref_wav_path = output_dir / "ref_converted.wav"
             convert_to_wav(reference_file, ref_wav_path)
             reference_file = ref_wav_path
         
@@ -346,10 +455,10 @@ async def change_voice(reference_speaker: str = Form(...), file: UploadFile = Fi
         audio_data, sr = generate_speech_with_prompt(text, cache_data["prompt"])
         
         # Save output
-        save_path = f'{output_dir}/output_converted.wav'
+        save_path = output_dir / "output_converted.wav"
         sf.write(save_path, audio_data, sr)
 
-        return StreamingResponse(open(save_path, 'rb'), media_type="audio/wav")
+        return StreamingResponse(open(save_path, "rb"), media_type="audio/wav")
     except Exception as e:
         logging.error(f"Error in change_voice: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -363,12 +472,13 @@ async def upload_audio(audio_file_label: str = Form(...), file: UploadFile = Fil
     try:
         contents = await file.read()
 
-        allowed_extensions = {'wav', 'mp3', 'flac', 'ogg'}
+        audio_file_label = validate_voice_name(audio_file_label)
+        allowed_extensions = {extension.removeprefix(".") for extension in AUDIO_EXTENSIONS}
         max_file_size = 5 * 1024 * 1024  # 5MB
 
         file_ext = file.filename.split('.')[-1].lower()
         if file_ext not in allowed_extensions:
-            return {"error": "Invalid file type. Allowed types are: wav, mp3, flac, ogg"}
+            return {"error": "Invalid file type. Allowed types are: wav, mp3, flac, ogg, m4a, aac"}
 
         if len(contents) > max_file_size:
             return {"error": "File size is over limit. Max size is 5MB."}
@@ -381,12 +491,23 @@ async def upload_audio(audio_file_label: str = Form(...), file: UploadFile = Fil
 
         stored_file_name = f"{audio_file_label}.{file_ext}"
 
-        with open(f"{resources_dir}/{stored_file_name}", "wb") as f:
+        stored_path = resources_dir / stored_file_name
+        with open(stored_path, "wb") as f:
             f.write(contents)
 
         # Also create a WAV version
-        wav_path = f"{resources_dir}/{audio_file_label}.wav"
-        convert_to_wav(f"{resources_dir}/{stored_file_name}", wav_path)
+        wav_path = resources_dir / f"{audio_file_label}.wav"
+        with tempfile.NamedTemporaryFile(
+            dir=resources_dir, prefix=f".{audio_file_label}-", suffix=".wav", delete=False
+        ) as temporary:
+            temporary_wav = Path(temporary.name)
+        try:
+            convert_to_wav(stored_path, temporary_wav)
+            temporary_wav.replace(wav_path)
+        finally:
+            temporary_wav.unlink(missing_ok=True)
+        if stored_path != wav_path:
+            stored_path.unlink(missing_ok=True)
         
         # Clear cached voice data if it exists (will be regenerated on next use)
         if audio_file_label in voice_cache:
@@ -412,22 +533,9 @@ async def synthesize_speech(
     try:
         logging.info(f'Generating speech for voice: {voice}')
 
-        # First try to find a WAV version
-        matching_files = [f for f in os.listdir(resources_dir) if f.startswith(voice) and f.lower().endswith('.wav')]
-        
-        # If no WAV found, try other formats and convert
-        if not matching_files:
-            matching_files = [f for f in os.listdir(resources_dir) if f.startswith(voice)]
-            if not matching_files:
-                raise HTTPException(status_code=400, detail="No matching voice found.")
-            
-            # Convert to WAV
-            input_file = f'{resources_dir}/{matching_files[0]}'
-            wav_path = f'{output_dir}/ref_converted.wav'
-            convert_to_wav(input_file, wav_path)
-            reference_file = wav_path
-        else:
-            reference_file = f'{resources_dir}/{matching_files[0]}'
+        reference_file = find_voice_file(voice)
+        if not reference_file:
+            raise HTTPException(status_code=400, detail="No matching voice found.")
 
         # Get or create cached voice data (includes transcription and voice prompt)
         if voice == "default_en" and default_ref_audio:
@@ -440,7 +548,7 @@ async def synthesize_speech(
         audio_data, sr = generate_speech_with_prompt(text, cache_data["prompt"], speed)
         
         # Save output
-        save_path = f'{output_dir}/output_synthesized.wav'
+        save_path = output_dir / "output_synthesized.wav"
         sf.write(save_path, audio_data, sr)
 
         result = StreamingResponse(open(save_path, 'rb'), media_type="audio/wav")

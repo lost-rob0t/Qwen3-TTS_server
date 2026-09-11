@@ -1,13 +1,12 @@
 #!/bin/bash
+set -euo pipefail
 
 # Change to the directory containing the server.py file
-cd "$(dirname "$0")"
+cd "$(dirname "$0")" || exit 1
 
 # Add the current directory to PYTHONPATH
-export PYTHONPATH="$PYTHONPATH:$(pwd)"
+server_dir="$(pwd)"
+export PYTHONPATH="${PYTHONPATH:+$PYTHONPATH:}$server_dir"
 
-# Start the FastAPI server with uvicorn in the background
-python -m uvicorn server:app --host 0.0.0.0 --port 7860 &
-
-# Keep container running for RunPod web terminal access
-sleep infinity
+# Keep uvicorn as PID 1 so Docker/systemd can stop and restart it cleanly.
+exec python -m uvicorn server:app --host 0.0.0.0 --port "${QWEN_PORT:-7860}"
