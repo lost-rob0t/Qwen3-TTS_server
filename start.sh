@@ -5,7 +5,8 @@ set -euo pipefail
 cd "$(dirname "$0")" || exit 1
 
 # Add the current directory to PYTHONPATH
-export PYTHONPATH="${PYTHONPATH:+$PYTHONPATH:}$(pwd)"
+server_dir="$(pwd)"
+export PYTHONPATH="${PYTHONPATH:+$PYTHONPATH:}$server_dir"
 
 # Keep uvicorn as PID 1 so Docker/systemd can stop and restart it cleanly.
 exec python -m uvicorn server:app --host 0.0.0.0 --port "${QWEN_PORT:-7860}"
