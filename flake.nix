@@ -60,6 +60,7 @@
           scripts = pkgs.runCommand "qwen3-tts-script-checks" {
             nativeBuildInputs = with pkgs; [ ffmpeg python3 shellcheck ];
           } ''
+            export PYTHONPYCACHEPREFIX="$TMPDIR/pycache"
             shellcheck ${self}/scripts/qwen3-tts ${self}/build.sh ${self}/start.sh
             python -m py_compile ${self}/server.py ${self}/scripts/voice_manager.py
             python -m unittest discover -s ${self}/tests -v
