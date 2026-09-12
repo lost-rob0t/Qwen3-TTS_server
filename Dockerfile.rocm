@@ -26,7 +26,7 @@ COPY requirements.txt /tmp/requirements.txt
 RUN python -m pip install --no-cache-dir --upgrade pip setuptools wheel \
     && python -m pip install --no-cache-dir -r /tmp/requirements.txt
 
-COPY server.py start.sh ./
+COPY server.py audio_utils.py start.sh ./
 COPY demo_speaker0.mp3 ./resources/demo_speaker0.mp3
 
 RUN mkdir -p outputs resources \
