@@ -47,22 +47,24 @@
       });
 
       devShells = forAllSystems (system:
-        let pkgs = nixpkgs.legacyPackages.${system};
+       let pkgs = nixpkgs.legacyPackages.${system};
+            python = pkgs.python3.withPackages (pythonPackages: [ pythonPackages.numpy ]);
         in {
           default = pkgs.mkShell {
-            packages = with pkgs; [ ffmpeg python3 shellcheck ];
+            packages = with pkgs; [ ffmpeg python shellcheck ];
           };
         });
 
       checks = forAllSystems (system:
         let pkgs = nixpkgs.legacyPackages.${system};
+            python = pkgs.python3.withPackages (pythonPackages: [ pythonPackages.numpy ]);
         in {
           scripts = pkgs.runCommand "qwen3-tts-script-checks" {
-            nativeBuildInputs = with pkgs; [ ffmpeg python3 shellcheck ];
+            nativeBuildInputs = with pkgs; [ ffmpeg python shellcheck ];
           } ''
             export PYTHONPYCACHEPREFIX="$TMPDIR/pycache"
             shellcheck ${self}/scripts/qwen3-tts ${self}/build.sh ${self}/start.sh
-            python -m py_compile ${self}/server.py ${self}/scripts/voice_manager.py
+            python -m py_compile ${self}/audio_utils.py ${self}/server.py ${self}/scripts/voice_manager.py
             python -m unittest discover -s ${self}/tests -v
             touch "$out"
           '';

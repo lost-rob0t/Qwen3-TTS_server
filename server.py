@@ -16,6 +16,8 @@ import logging
 import numpy as np
 from pathlib import Path
 
+from audio_utils import normalize_reference_audio
+
 logging.basicConfig(level=logging.INFO)
 
 app = FastAPI()
@@ -329,6 +331,7 @@ def get_or_create_voice_cache(voice: str, reference_file: str | Path) -> dict:
     
     # Create reusable voice clone prompt
     ref_audio_data, ref_sr = sf.read(processed_ref)
+    ref_audio_data = normalize_reference_audio(ref_audio_data)
     voice_prompt = model.create_voice_clone_prompt(
         ref_audio=(ref_audio_data, ref_sr),
         ref_text=ref_text,
