@@ -84,7 +84,7 @@ ENV PYTHONUNBUFFERED=1
 RUN mkdir -p /app/server/outputs /app/server/resources
 
 # Copy server files to /app
-COPY server.py /app/server/
+COPY server.py audio_utils.py /app/server/
 COPY start.sh /app/server/
 COPY demo_speaker0.mp3 /app/server/resources/
 
