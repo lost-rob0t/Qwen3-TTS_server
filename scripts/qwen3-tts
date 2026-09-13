@@ -8,6 +8,7 @@ BACKEND="${QWEN_BACKEND:-rocm}"
 PORT="${QWEN_PORT:-7860}"
 BIND_ADDRESS="${QWEN_BIND_ADDRESS:-127.0.0.1}"
 CONTAINER_NAME="${QWEN_CONTAINER_NAME:-qwen3-tts-server}"
+RESTART_POLICY="${QWEN_RESTART_POLICY:-no}"
 
 die() {
     printf 'qwen3-tts: %s\n' "$*" >&2
@@ -20,13 +21,13 @@ Usage: qwen3-tts COMMAND [ARGS]
 
   build [rocm|cuda|cpu]       Build the selected container image
   serve [rocm|cuda|cpu]       Run in the foreground (for systemd)
-  start [rocm|cuda|cpu]       Run persistently in the background
+  start [rocm|cuda|cpu]       Run in the background without boot persistence
   stop                        Stop the server
   restart [rocm|cuda|cpu]     Restart the server
   status                      Show container and API status
   logs [-f]                   Show server logs
   doctor [rocm|cuda|cpu]      Check host and container GPU access
-  install-user [BACKEND]      Install and start a systemd user service
+  install-user [BACKEND]      Install a disabled systemd user service
   uninstall-user              Remove the systemd user service
   voice COMMAND ...           Add, list, rename, remove, or export voices
 
@@ -35,6 +36,7 @@ Examples:
   qwen3-tts voice add narrator sample.mp3 --replace
   qwen3-tts voice set-default narrator
   qwen3-tts install-user rocm
+  systemctl --user start qwen3-tts.service
 EOF
 }
 
@@ -142,7 +144,7 @@ run_server() {
     if [[ "$mode" == foreground ]]; then
         exec "$ENGINE" run --rm "${args[@]}" "$image"
     fi
-    "$ENGINE" run --detach --restart=unless-stopped "${args[@]}" "$image"
+    "$ENGINE" run --detach --restart="$RESTART_POLICY" "${args[@]}" "$image"
     printf 'Qwen3-TTS is starting at http://%s:%s\n' "$BIND_ADDRESS" "$PORT"
 }
 
@@ -178,7 +180,8 @@ install_user_service() {
     local unit="$unit_dir/qwen3-tts.service"
     mkdir -p "$unit_dir"
     {
-        printf '%s\n' '[Unit]' 'Description=Qwen3-TTS service' 'After=network-online.target' 'Wants=network-online.target'
+        printf '%s\n' '[Unit]' 'Description=Qwen3-TTS service' 'After=network-online.target' 'Wants=network-online.target' \
+            'StartLimitIntervalSec=60' 'StartLimitBurst=2'
         printf '\n%s\n' '[Service]' 'Type=simple' "Environment=QWEN_BACKEND=$backend" "Environment=QWEN3_TTS_DATA_DIR=$DATA_DIR"
         printf 'Environment=QWEN_PORT=%s\n' "$PORT"
         printf 'Environment=QWEN_BIND_ADDRESS=%s\n' "$BIND_ADDRESS"
@@ -192,13 +195,14 @@ install_user_service() {
         done
         printf 'ExecStart=%s serve %s\n' "$executable" "$backend"
         printf 'ExecStop=%s stop\n' "$executable"
-        printf '%s\n' 'Restart=always' 'RestartSec=5' 'TimeoutStartSec=infinity'
+        printf '%s\n' 'Restart=on-failure' 'RestartSec=10' 'TimeoutStartSec=infinity'
         printf '\n%s\n' '[Install]' 'WantedBy=default.target'
     } >"$unit"
     systemctl --user daemon-reload
-    systemctl --user enable --now qwen3-tts.service
-    printf 'installed %s\n' "$unit"
-    printf 'For startup before login, run: sudo loginctl enable-linger %q\n' "$USER"
+    systemctl --user disable --now qwen3-tts.service >/dev/null 2>&1 || true
+    printf 'installed %s (disabled and stopped)\n' "$unit"
+    printf 'Start once: systemctl --user start qwen3-tts.service\n'
+    printf 'Enable at login only after validation: systemctl --user enable --now qwen3-tts.service\n'
 }
 
 uninstall_user_service() {

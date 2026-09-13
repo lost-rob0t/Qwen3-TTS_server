@@ -8,6 +8,12 @@ in {
   options.services.qwen3-tts = {
     enable = mkEnableOption "the Qwen3-TTS user service";
 
+    autoStart = mkOption {
+      type = types.bool;
+      default = false;
+      description = "Start Qwen3-TTS automatically with the user session. Disabled by default because GPU backend failures can destabilize the desktop session.";
+    };
+
     package = mkOption {
       type = types.package;
       default = self.packages.${pkgs.system}.qwen3-tts;
@@ -47,6 +53,8 @@ in {
         Description = "Qwen3-TTS service";
         After = [ "network-online.target" ];
         Wants = [ "network-online.target" ];
+        StartLimitIntervalSec = 60;
+        StartLimitBurst = 2;
       };
       Service = {
         Environment = lib.mapAttrsToList (name: value: "${name}=${value}") (cfg.environment // {
@@ -57,11 +65,11 @@ in {
         });
         ExecStart = "${cfg.package}/bin/qwen3-tts serve ${cfg.backend}";
         ExecStop = "${cfg.package}/bin/qwen3-tts stop";
-        Restart = "always";
-        RestartSec = 5;
+        Restart = "on-failure";
+        RestartSec = 10;
         TimeoutStartSec = "infinity";
       };
-      Install.WantedBy = [ "default.target" ];
+      Install.WantedBy = lib.optionals cfg.autoStart [ "default.target" ];
     };
   };
 }

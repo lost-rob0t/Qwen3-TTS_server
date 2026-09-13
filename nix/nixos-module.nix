@@ -8,6 +8,12 @@ in {
   options.services.qwen3-tts = {
     enable = mkEnableOption "the Qwen3-TTS service";
 
+    autoStart = mkOption {
+      type = types.bool;
+      default = false;
+      description = "Start Qwen3-TTS automatically at boot. Disabled by default because GPU backend failures can destabilize the host.";
+    };
+
     package = mkOption {
       type = types.package;
       default = self.packages.${pkgs.system}.qwen3-tts;
@@ -62,9 +68,13 @@ in {
 
       systemd.services.qwen3-tts = {
         description = "Qwen3-TTS service";
-        wantedBy = [ "multi-user.target" ];
+        wantedBy = lib.optionals cfg.autoStart [ "multi-user.target" ];
         after = [ "docker.service" "network-online.target" ];
         wants = [ "docker.service" "network-online.target" ];
+        unitConfig = {
+          StartLimitIntervalSec = 60;
+          StartLimitBurst = 2;
+        };
         environment = cfg.environment // {
           QWEN_BACKEND = cfg.backend;
           QWEN_PORT = toString cfg.port;
@@ -74,8 +84,8 @@ in {
         serviceConfig = {
           ExecStart = "${cfg.package}/bin/qwen3-tts serve ${cfg.backend}";
           ExecStop = "${cfg.package}/bin/qwen3-tts stop";
-          Restart = "always";
-          RestartSec = 5;
+          Restart = "on-failure";
+          RestartSec = 10;
           TimeoutStartSec = "infinity";
         } // lib.optionalAttrs (cfg.user != null) {
           User = cfg.user;
