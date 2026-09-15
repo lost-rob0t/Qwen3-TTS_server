@@ -4,11 +4,18 @@ set -euo pipefail
 SOURCE_DIR="${QWEN3_TTS_SOURCE:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 DATA_DIR="${QWEN3_TTS_DATA_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/qwen3-tts}"
 ENGINE="${QWEN_CONTAINER_ENGINE:-docker}"
-BACKEND="${QWEN_BACKEND:-rocm}"
+BACKEND="${QWEN_BACKEND:-vulkan}"
 PORT="${QWEN_PORT:-7860}"
 BIND_ADDRESS="${QWEN_BIND_ADDRESS:-127.0.0.1}"
 CONTAINER_NAME="${QWEN_CONTAINER_NAME:-qwen3-tts-server}"
 RESTART_POLICY="${QWEN_RESTART_POLICY:-no}"
+
+IMAGE_REGISTRY="ghcr.io/serveurpersocom/qwentts.cpp"
+IMAGE_TAG="${QWEN_IMAGE_TAG:-71ad93d591a2811f35db77e27c02acba091c9e9b}"
+
+MODEL_REPO="https://huggingface.co/Serveurperso/Qwen3-TTS-GGUF/resolve/b7ee2e8c7459c3bea99da23e3d178125a7d1713c"
+TALKER_MODEL="${QWEN_TALKER_MODEL:-qwen-talker-0.6b-base-Q8_0.gguf}"
+CODEC_MODEL="${QWEN_CODEC_MODEL:-qwen-tokenizer-12hz-Q8_0.gguf}"
 
 die() {
     printf 'qwen3-tts: %s\n' "$*" >&2
@@ -19,82 +26,107 @@ usage() {
     cat <<'EOF'
 Usage: qwen3-tts COMMAND [ARGS]
 
-  build [rocm|cuda|cpu]       Build the selected container image
-  serve [rocm|cuda|cpu]       Run in the foreground (for systemd)
-  start [rocm|cuda|cpu]       Run in the background without boot persistence
+  pull [vulkan|cuda|cpu]      Pull the pinned upstream GGML server image
+  serve [vulkan|cuda|cpu]     Run in the foreground (for systemd)
+  start [vulkan|cuda|cpu]     Run in the background without boot persistence
   stop                        Stop the server
-  restart [rocm|cuda|cpu]     Restart the server
+  restart [vulkan|cuda|cpu]   Restart the server
   status                      Show container and API status
   logs [-f]                   Show server logs
-  doctor [rocm|cuda|cpu]      Check host and container GPU access
+  doctor [vulkan|cuda|cpu]    Pre-flight checks (host devices, image, models)
   install-user [BACKEND]      Install a disabled systemd user service
   uninstall-user              Remove the systemd user service
   voice COMMAND ...           Add, list, rename, remove, or export voices
 
+Backends: vulkan (AMD/Intel/NVIDIA via render nodes), cuda, cpu.
+The vulkan backend only needs /dev/dri; compute stays off the graphics
+queue by default so the desktop session is never the failure surface.
+
 Examples:
+  qwen3-tts doctor vulkan
   qwen3-tts voice add narrator interview.mp4 --start 01:12 --text "Exact words spoken"
-  qwen3-tts voice add narrator sample.mp3 --replace
   qwen3-tts voice set-default narrator
-  qwen3-tts install-user rocm
+  qwen3-tts install-user vulkan
   systemctl --user start qwen3-tts.service
 EOF
 }
 
-image_for() {
-    local backend="$1"
-    printf '%s\n' "${QWEN_IMAGE:-qwen3-tts_server:${backend}}"
-}
-
-dockerfile_for() {
+valid_backend() {
     case "$1" in
-        rocm) printf '%s\n' Dockerfile.rocm ;;
-        cuda) printf '%s\n' Dockerfile.cuda ;;
-        cpu) printf '%s\n' Dockerfile.cpu ;;
-        *) die "unknown backend '$1'; expected rocm, cuda, or cpu" ;;
+        vulkan|cuda|cpu) return 0 ;;
+        *) return 1 ;;
     esac
 }
 
-prepare_data() {
-    mkdir -p "$DATA_DIR/voices" "$DATA_DIR/outputs" \
-        "$DATA_DIR/cache/huggingface" "$DATA_DIR/cache/whisper"
-    if ! find "$DATA_DIR/voices" -maxdepth 1 -type f -print -quit | grep -q .; then
-        cp "$SOURCE_DIR/demo_speaker0.mp3" "$DATA_DIR/voices/"
-    fi
+require_backend() {
+    valid_backend "$1" || die "unknown backend '$1'; expected vulkan, cuda, or cpu"
 }
 
-build_image() {
+image_for() {
     local backend="$1"
-    local image
-    local -a build_args=()
-    image="$(image_for "$backend")"
-    if [[ "$backend" == rocm && -n "${QWEN_ROCM_IMAGE:-}" ]]; then
-        build_args+=(--build-arg "ROCM_IMAGE=$QWEN_ROCM_IMAGE")
+    printf '%s\n' "${QWEN_IMAGE:-${IMAGE_REGISTRY}:${backend}-${IMAGE_TAG}}"
+}
+
+prepare_data() {
+    mkdir -p "$DATA_DIR/voices" "$DATA_DIR/models"
+}
+
+model_sha256() {
+    case "$1" in
+        qwen-talker-0.6b-base-Q8_0.gguf)
+            printf '%s\n' d54dbaf10591421fa764ed630d764efa717ae40cd959bd48c66d4eb1af226426 ;;
+        qwen-tokenizer-12hz-Q8_0.gguf)
+            printf '%s\n' 1883beeed99348fc35e23dd225e9082f93f6f8c109330a33d935baa8acdbfd94 ;;
+        *) return 1 ;;
+    esac
+}
+
+verify_model() {
+    local path="$1"
+    local expected
+    if ! expected="$(model_sha256 "$(basename "$path")")"; then
+        [[ -s "$path" ]] || return 1
+        return 0
     fi
-    "$ENGINE" build \
-        --file "$SOURCE_DIR/$(dockerfile_for "$backend")" \
-        --tag "$image" \
-        "${build_args[@]}" \
-        "$SOURCE_DIR"
+    printf '%s  %s\n' "$expected" "$path" | sha256sum --check --status
+}
+
+download_model() {
+    local name="$1"
+    local destination="$DATA_DIR/models/$name"
+    if [[ -f "$destination" ]] && verify_model "$destination"; then
+        return 0
+    fi
+    local partial="${destination}.part"
+    printf 'downloading %s\n' "$name"
+    curl --fail --location --progress-bar --output "$partial" "$MODEL_REPO/$name"
+    mv "$partial" "$destination"
+    verify_model "$destination" || {
+        rm -f "$destination"
+        die "sha256 mismatch for $name; download was corrupt"
+    }
+}
+
+ensure_models() {
+    download_model "$TALKER_MODEL"
+    download_model "$CODEC_MODEL"
 }
 
 ensure_image() {
-    local backend="$1"
     local image
-    image="$(image_for "$backend")"
-    if ! "$ENGINE" image inspect "$image" >/dev/null 2>&1; then
-        build_image "$backend"
-    fi
+    image="$(image_for "$1")"
+    "$ENGINE" image inspect "$image" >/dev/null 2>&1 && return 0
+    "$ENGINE" pull "$image"
 }
 
 device_args() {
     local backend="$1"
     case "$backend" in
-        rocm)
-            [[ -e /dev/kfd ]] || die "/dev/kfd is missing; load/install the AMDGPU/ROCm host driver"
+        vulkan)
             [[ -d /dev/dri ]] || die "/dev/dri is missing; load/install the AMDGPU host driver"
-            printf '%s\n' --device=/dev/kfd --device=/dev/dri --group-add="$(stat -c %g /dev/kfd)" \
-                --ipc=host --shm-size=8g \
-                --security-opt=seccomp=unconfined
+            [[ -e /dev/dri/renderD128 ]] || die "/dev/dri/renderD128 is missing; no render node available"
+            printf '%s\n' --device=/dev/dri \
+                --group-add="$(stat -c %g /dev/dri/renderD128)"
             ;;
         cuda)
             printf '%s\n' --gpus=all
@@ -106,8 +138,10 @@ device_args() {
 
 environment_args() {
     local variable
-    for variable in QWEN_DEVICE QWEN_DTYPE QWEN_MODEL QWEN_WHISPER_MODEL \
-        QWEN_ATTENTION HSA_OVERRIDE_GFX_VERSION HIP_VISIBLE_DEVICES; do
+    for variable in TTS_LANG MODEL_ALIAS WARMUP_VOICE WARMUP_MAX_NEW_TOKENS \
+        MAX_BATCH MAX_PREFILL_TOKENS CODEC_CHUNK_DUR NO_FA CLAMP_FP16 \
+        GGML_VK_ALLOW_GRAPHICS_QUEUE GGML_VK_ASYNC_USE_TRANSFER_QUEUE \
+        GGML_VK_SERIALIZE_SUBMISSIONS GGML_VK_DISABLE_F16 RADV_PERFTEST; do
         if [[ -n "${!variable:-}" ]]; then
             printf '%s\n' --env "$variable=${!variable}"
         fi
@@ -120,13 +154,13 @@ container_args() {
         --name "$CONTAINER_NAME" \
         --init \
         --publish "$BIND_ADDRESS:$PORT:7860" \
-        --volume "$DATA_DIR/voices:/app/server/resources" \
-        --volume "$DATA_DIR/outputs:/app/server/outputs" \
-        --volume "$DATA_DIR/cache/huggingface:/root/.cache/huggingface" \
-        --volume "$DATA_DIR/cache/whisper:/root/.cache/whisper" \
-        --env QWEN_RESOURCES_DIR=/app/server/resources \
-        --env QWEN_OUTPUT_DIR=/app/server/outputs \
-        --env QWEN_DEVICE="${QWEN_DEVICE:-auto}"
+        --volume "$DATA_DIR/voices:/voices" \
+        --volume "$DATA_DIR/models:/models" \
+        --env MODEL_PATH="/models/$TALKER_MODEL" \
+        --env CODEC_PATH="/models/$CODEC_MODEL" \
+        --env PORT=7860 \
+        --env HOST=0.0.0.0 \
+        --env MODEL_ALIAS="${MODEL_ALIAS:-qwen3-tts}"
     device_args "$backend"
     environment_args
 }
@@ -136,8 +170,10 @@ run_server() {
     local mode="$2"
     local image
     local -a args
+    require_backend "$backend"
     ensure_image "$backend"
     prepare_data
+    ensure_models
     image="$(image_for "$backend")"
     mapfile -t args < <(container_args "$backend")
     "$ENGINE" rm --force "$CONTAINER_NAME" >/dev/null 2>&1 || true
@@ -150,27 +186,39 @@ run_server() {
 
 doctor() {
     local backend="$1"
+    require_backend "$backend"
     command -v "$ENGINE" >/dev/null || die "$ENGINE is not installed"
     "$ENGINE" info >/dev/null || die "$ENGINE daemon is not available to this user"
     printf 'engine: %s\nbackend: %s\ndata: %s\n' "$ENGINE" "$backend" "$DATA_DIR"
-    if [[ "$backend" == rocm ]]; then
-        [[ -e /dev/kfd ]] && printf '/dev/kfd: ok\n' || printf '/dev/kfd: missing\n'
+    if [[ "$backend" == vulkan ]]; then
         [[ -d /dev/dri ]] && printf '/dev/dri: ok\n' || printf '/dev/dri: missing\n'
+        [[ -e /dev/dri/renderD128 ]] && printf 'render node: ok\n' || printf 'render node: missing\n'
     fi
     local image
     image="$(image_for "$backend")"
     if "$ENGINE" image inspect "$image" >/dev/null 2>&1; then
-        local -a args
-        mapfile -t args < <(device_args "$backend")
-        "$ENGINE" run --rm --entrypoint python "${args[@]}" "$image" -c \
-            'import torch; print({"available": torch.cuda.is_available(), "hip": torch.version.hip, "device": torch.cuda.get_device_name(0) if torch.cuda.is_available() else None})'
+        printf 'image: %s\n' "$image"
     else
-        printf 'image: not built (run qwen3-tts build %s)\n' "$backend"
+        printf 'image: not pulled (run qwen3-tts pull %s)\n' "$backend"
     fi
+    local model
+    for model in "$TALKER_MODEL" "$CODEC_MODEL"; do
+        if [[ -f "$DATA_DIR/models/$model" ]]; then
+            if verify_model "$DATA_DIR/models/$model"; then
+                printf 'model %s: ok\n' "$model"
+            else
+                printf 'model %s: FAILED sha256 (delete and re-run to re-provision)\n' "$model"
+            fi
+        else
+            printf 'model %s: missing (provisioned on first start)\n' "$model"
+        fi
+    done
+    printf 'note: doctor is a pre-flight check only; GPU inference proof is a separate bounded validation run with kernel log monitoring\n'
 }
 
 install_user_service() {
     local backend="$1"
+    require_backend "$backend"
     [[ -n "${QWEN3_TTS_EXECUTABLE:-}" ]] || die "run this through the flake: nix run .#qwen3-tts -- install-user $backend"
     local profile="${XDG_STATE_HOME:-$HOME/.local/state}/qwen3-tts/profile"
     mkdir -p "$(dirname "$profile")"
@@ -186,8 +234,10 @@ install_user_service() {
         printf 'Environment=QWEN_PORT=%s\n' "$PORT"
         printf 'Environment=QWEN_BIND_ADDRESS=%s\n' "$BIND_ADDRESS"
         printf 'Environment=QWEN_CONTAINER_ENGINE=%s\n' "$ENGINE"
-        for variable in QWEN_DEVICE QWEN_DTYPE QWEN_MODEL QWEN_WHISPER_MODEL \
-            QWEN_ATTENTION QWEN_ROCM_IMAGE HSA_OVERRIDE_GFX_VERSION HIP_VISIBLE_DEVICES; do
+        for variable in QWEN_IMAGE QWEN_IMAGE_TAG QWEN_TALKER_MODEL QWEN_CODEC_MODEL \
+            TTS_LANG MODEL_ALIAS WARMUP_VOICE WARMUP_MAX_NEW_TOKENS MAX_BATCH MAX_PREFILL_TOKENS \
+            CODEC_CHUNK_DUR GGML_VK_ALLOW_GRAPHICS_QUEUE GGML_VK_ASYNC_USE_TRANSFER_QUEUE \
+            GGML_VK_SERIALIZE_SUBMISSIONS GGML_VK_DISABLE_F16 RADV_PERFTEST; do
             if [[ -n "${!variable:-}" ]]; then
                 [[ "${!variable}" != *$'\n'* ]] || die "$variable cannot contain a newline"
                 printf 'Environment=%s=%s\n' "$variable" "${!variable}"
@@ -219,7 +269,11 @@ command="${1:-help}"
 shift || true
 
 case "$command" in
-    build) build_image "${1:-$BACKEND}" ;;
+    pull)
+        backend="${1:-$BACKEND}"
+        require_backend "$backend"
+        ensure_image "$backend"
+        ;;
     serve) run_server "${1:-$BACKEND}" foreground ;;
     start) run_server "${1:-$BACKEND}" detached ;;
     stop) "$ENGINE" rm --force "$CONTAINER_NAME" >/dev/null 2>&1 || true ;;

@@ -21,9 +21,9 @@ in {
     };
 
     backend = mkOption {
-      type = types.enum [ "rocm" "cuda" "cpu" ];
-      default = "rocm";
-      description = "Acceleration backend.";
+      type = types.enum [ "vulkan" "cuda" "cpu" ];
+      default = "vulkan";
+      description = "Acceleration backend. Vulkan covers AMD, Intel, and NVIDIA through render nodes; CUDA is the dedicated NVIDIA path; CPU is the explicit emergency mode.";
     };
 
     port = mkOption {
