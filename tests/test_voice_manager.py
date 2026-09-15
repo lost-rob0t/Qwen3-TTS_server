@@ -82,5 +82,69 @@ class VoiceManagerTest(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
 
 
+class VoiceTranscriptContractTest(unittest.TestCase):
+    """The GGML server entrypoint pairs each voices/<name>.wav with an
+    optional same-stem <name>.txt whose contents become the ref_text ICL
+    clone payload. Without a transcript the server can only fall back to
+    the lower fidelity x_vector_only path, so the manager must keep the
+    .txt artifact in sync with every lifecycle operation."""
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name)
+        self.voices = self.root / "voices"
+        self.sample = self.root / "sample.wav"
+        VoiceManagerTest.write_sample(self.sample)
+
+    def tearDown(self):
+        self.temporary.cleanup()
+
+    def run_cli(self, *arguments, check=True):
+        return subprocess.run(
+            [sys.executable, str(SCRIPT), "--directory", str(self.voices), *arguments],
+            check=check,
+            capture_output=True,
+            text=True,
+        )
+
+    def test_add_with_text_writes_transcript_file(self):
+        self.run_cli("add", "voiced", str(self.sample), "--text", "Exact words spoken.")
+        transcript = self.voices / "voiced.txt"
+        self.assertTrue(transcript.is_file())
+        self.assertEqual(transcript.read_text(encoding="utf-8").strip(), "Exact words spoken.")
+
+    def test_add_without_text_writes_no_transcript_file(self):
+        self.run_cli("add", "unvoiced", str(self.sample))
+        self.assertFalse((self.voices / "unvoiced.txt").exists())
+
+    def test_set_text_creates_and_updates_transcript(self):
+        self.run_cli("add", "voiced", str(self.sample))
+        self.run_cli("set-text", "voiced", "First transcript.")
+        self.assertEqual((self.voices / "voiced.txt").read_text(encoding="utf-8").strip(), "First transcript.")
+        self.run_cli("set-text", "voiced", "Updated transcript.")
+        self.assertEqual((self.voices / "voiced.txt").read_text(encoding="utf-8").strip(), "Updated transcript.")
+
+    def test_rename_moves_transcript(self):
+        self.run_cli("add", "voiced", str(self.sample), "--text", "Traveling transcript.")
+        self.run_cli("rename", "voiced", "moved")
+        self.assertFalse((self.voices / "voiced.txt").exists())
+        self.assertEqual((self.voices / "moved.txt").read_text(encoding="utf-8").strip(), "Traveling transcript.")
+
+    def test_remove_deletes_transcript(self):
+        self.run_cli("add", "voiced", str(self.sample), "--text", "Doomed transcript.")
+        self.run_cli("remove", "voiced", "--force")
+        self.assertFalse((self.voices / "voiced.txt").exists())
+
+    def test_set_default_copies_transcript(self):
+        self.run_cli("add", "voiced", str(self.sample), "--text", "Default transcript.")
+        self.run_cli("set-default", "voiced")
+        self.assertEqual((self.voices / "default_en.txt").read_text(encoding="utf-8").strip(), "Default transcript.")
+
+    def test_transcript_with_special_characters_survives_roundtrip(self):
+        text = 'He said "quotes", back\\slash, and 100% newlines\nare fine.'
+        self.run_cli("add", "quoted", str(self.sample), "--text", text)
+        self.assertEqual((self.voices / "quoted.txt").read_text(encoding="utf-8").strip(), text.strip())
+
+
 if __name__ == "__main__":
     unittest.main()

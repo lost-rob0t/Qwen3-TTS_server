@@ -46,6 +46,24 @@ def metadata_file(directory: Path, name: str) -> Path:
     return directory / f"{name}.json"
 
 
+def transcript_file(directory: Path, name: str) -> Path:
+    return directory / f"{name}.txt"
+
+
+def write_transcript(directory: Path, name: str, text: str | None) -> None:
+    destination = transcript_file(directory, name)
+    if not text:
+        destination.unlink(missing_ok=True)
+        return
+    with tempfile.NamedTemporaryFile(
+        mode="w", encoding="utf-8", dir=directory, prefix=f".{name}-", suffix=".txt", delete=False
+    ) as temporary:
+        temporary.write(text.rstrip("\n"))
+        temporary.write("\n")
+        temporary_path = Path(temporary.name)
+    temporary_path.replace(destination)
+
+
 def read_metadata(directory: Path, name: str) -> dict:
     path = metadata_file(directory, name)
     if not path.is_file():
@@ -129,6 +147,7 @@ def command_add(args: argparse.Namespace) -> None:
         "reference_text": args.text,
     }
     write_metadata(args.directory, args.name, metadata)
+    write_transcript(args.directory, args.name, args.text)
     print(f"added {args.name}: {destination}")
 
 
@@ -163,7 +182,7 @@ def command_remove(args: argparse.Namespace) -> None:
     require_voice(args.directory, args.name)
     if args.name == "default_en" and not args.force:
         raise SystemExit("refusing to remove default_en without --force")
-    for extension in (*AUDIO_EXTENSIONS, ".json"):
+    for extension in (*AUDIO_EXTENSIONS, ".json", ".txt"):
         (args.directory / f"{args.name}{extension}").unlink(missing_ok=True)
     print(f"removed {args.name}")
 
@@ -176,6 +195,9 @@ def command_rename(args: argparse.Namespace) -> None:
     source.replace(destination)
     metadata = read_metadata(args.directory, args.name)
     metadata_file(args.directory, args.name).unlink(missing_ok=True)
+    transcript = transcript_file(args.directory, args.name)
+    if transcript.is_file():
+        transcript.replace(transcript_file(args.directory, args.new_name))
     metadata["name"] = args.new_name
     metadata["renamed_at"] = datetime.now(timezone.utc).isoformat()
     write_metadata(args.directory, args.new_name, metadata)
@@ -189,6 +211,7 @@ def command_set_text(args: argparse.Namespace) -> None:
     metadata["reference_text"] = args.text
     metadata["updated_at"] = datetime.now(timezone.utc).isoformat()
     write_metadata(args.directory, args.name, metadata)
+    write_transcript(args.directory, args.name, args.text)
     print(f"updated transcript for {args.name}")
 
 
@@ -207,6 +230,12 @@ def command_default(args: argparse.Namespace) -> None:
     metadata = read_metadata(args.directory, args.name)
     metadata.update({"name": "default_en", "source_voice": args.name})
     write_metadata(args.directory, "default_en", metadata)
+    source_transcript = transcript_file(args.directory, args.name)
+    default_transcript = transcript_file(args.directory, "default_en")
+    if source_transcript.is_file():
+        shutil.copyfile(source_transcript, default_transcript)
+    else:
+        default_transcript.unlink(missing_ok=True)
     print(f"default voice is now {args.name}")
 
 
